@@ -230,6 +230,39 @@ describe('gallery old image cleanup', () => {
     expect(deleteImageFileOnly).not.toHaveBeenCalled();
   });
 
+  it('selects and deletes only existing unmatched images across roles, including collapsed groups', async () => {
+    const files = [keyOf(alpha, 'image-1.png'), keyOf(alpha, 'image-52.png'), keyOf(beta, 'image-3.png')];
+    const missing = keyOf(beta, 'image-4.png');
+    vi.mocked(runImageRetention).mockImplementation(async (_policy, confirm) => {
+      await confirm(0, { retained: 54, unmatched: new Set([...files, missing]) });
+      return undefined;
+    });
+    const root = await mount();
+    await click(find(root, 'button').find(button => text(button).includes('清理旧图'))!);
+    await flush();
+    markImageMissing(missing);
+    await click(find(root, 'button').find(button => text(button) === '查看未匹配图片')!);
+
+    (find(root, '.gal-search')[0].props['onUpdate:modelValue'] as (query: string) => void)('Beta');
+    await nextTick();
+    expect(find(root, '.gal-fold-trigger')).toHaveLength(1);
+    await click(find(root, 'button').find(button => text(button) === '全选未匹配（3 张）')!);
+    expect(find(root, '.gal-fold-trigger')).toHaveLength(2);
+    expect(text(find(root, '.gal-actionbar-count')[0])).toBe('已选 3 张');
+    expect(deleteImageFileOnly).not.toHaveBeenCalled();
+
+    vi.mocked(confirmDialog).mockResolvedValueOnce(false);
+    await click(find(root, '.bbi-btn-danger')[0]);
+    expect(confirmDialog).toHaveBeenLastCalledWith(expect.objectContaining({ title: '删除 3 张未匹配图片' }));
+    expect(deleteImageFileOnly).not.toHaveBeenCalled();
+
+    await click(find(root, '.bbi-btn-danger')[0]);
+    await flush();
+    expect(vi.mocked(deleteImageFileOnly).mock.calls.map(([path]) => path).sort()).toEqual(files.sort());
+    expect(isImageMissing(keyOf(alpha, 'image-0.png'))).toBe(false);
+    expect(find(root, 'button').some(button => text(button).includes('全选未匹配'))).toBe(false);
+  });
+
   it('remounts the cleanup button with its current progress and then clears it', async () => {
     const state = imageRetentionProgress as Vue.ShallowRef<typeof imageRetentionProgress.value>;
     const label = imageRetentionStatus as Vue.ShallowRef<string>;

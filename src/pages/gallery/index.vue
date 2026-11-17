@@ -309,16 +309,21 @@ const totalSizeText = computed(() => {
   return bytes ? formatBytes(bytes) : '';
 });
 
-const filtered = computed(() => {
-  const q = query.value.trim().toLowerCase();
-  const matching = q ? groups.value.filter(group => group.name.toLowerCase().includes(q)) : groups.value;
+const unmatchedGroups = computed(() => {
   const unmatched = lastCleanup.value?.summary?.unmatched;
-  if (!showUnmatched.value || !unmatched) return matching;
-  return matching
+  if (!unmatched?.size) return [];
+  return groups.value
     .map(group => ({ ...group, images: group.images.filter(image => unmatched.has(image.key)) }))
     .filter(group => group.images.length > 0);
 });
 
+const filtered = computed(() => {
+  const source = showUnmatched.value ? unmatchedGroups.value : groups.value;
+  const q = query.value.trim().toLowerCase();
+  return q ? source.filter(group => group.name.toLowerCase().includes(q)) : source;
+});
+
+const unmatchedCount = computed(() => unmatchedGroups.value.reduce((n, group) => n + group.images.length, 0));
 const totalImages = computed(() => groups.value.reduce((n, g) => n + g.images.length, 0));
 
 /* 默认折叠,仅记录手动展开的分组。旧 collapsed 列表不能反推哪些组是手动展开的。 */
@@ -396,6 +401,13 @@ function toggleSelecting(): void {
   if (!selecting.value) selected.value = new Set();
 }
 
+function selectAllUnmatched(): void {
+  if (!showUnmatched.value || !unmatchedCount.value || deleting.value || imageRetentionProgress.value) return;
+  query.value = '';
+  selected.value = new Set(unmatchedGroups.value.flatMap(group => group.images.map(image => image.key)));
+  selecting.value = true;
+}
+
 function toggleSelected(image: GalleryImage): void {
   const next = new Set(selected.value);
   if (next.has(image.key)) next.delete(image.key);
@@ -442,15 +454,17 @@ async function deleteSelected(): Promise<void> {
     .filter(image => selected.value.has(image.key));
   if (!targets.length) return;
 
+  const description = showUnmatched.value ? '未匹配图片' : '图片';
   const ok = await confirmDialog({
-    title: `删除 ${targets.length} 张图片`,
+    title: `删除 ${targets.length} 张${description}`,
     text:
-      `将从磁盘删除这 ${targets.length} 张图片及其提示词侧写文件，无法恢复。\n\n` +
+      `将从磁盘删除这 ${targets.length} 张${description}及其提示词侧写文件，无法恢复。\n\n` +
+      (showUnmatched.value ? '未匹配的图片也可能有独立保存的图，请确认选中范围。\n\n' : '') +
       '聊天记录不会被改动：楼层卡片会显示「图片文件已删除」并退回可重新生成的状态。',
     confirmText: '删除',
     tone: 'danger',
   });
-  if (!ok) return;
+  if (!ok || deleting.value || imageRetentionProgress.value) return;
 
   deleting.value = true;
   try {
@@ -593,14 +607,22 @@ async function open(image: GalleryImage): Promise<void> {
       <p v-if="lastCleanup.rules">{{ lastCleanup.rules }}</p>
       <template v-if="lastCleanup.summary">
         <p>上次扫描的图库图片中，有 {{ lastCleanup.summary.retained }} 张按规则保留，{{ lastCleanup.summary.unmatched.size }} 张未匹配到柏宝绘楼层记录。</p>
-        <button
-          v-if="lastCleanup.summary.unmatched.size"
-          type="button"
-          class="bbi-btn bbi-btn-sm"
-          :aria-pressed="showUnmatched"
-          :disabled="selecting || deleting"
-          @click="showUnmatched = !showUnmatched"
-        >{{ showUnmatched ? '显示全部图片' : '查看未匹配图片' }}</button>
+        <div v-if="lastCleanup.summary.unmatched.size" class="gal-cleanup-actions">
+          <button
+            type="button"
+            class="bbi-btn bbi-btn-sm"
+            :aria-pressed="showUnmatched"
+            :disabled="selecting || deleting"
+            @click="showUnmatched = !showUnmatched"
+          >{{ showUnmatched ? '显示全部图片' : '查看未匹配图片' }}</button>
+          <button
+            v-if="showUnmatched && unmatchedCount"
+            type="button"
+            class="bbi-btn bbi-btn-sm"
+            :disabled="deleting || (selecting && selectedCount === unmatchedCount)"
+            @click="selectAllUnmatched"
+          >全选未匹配（{{ unmatchedCount }} 张）</button>
+        </div>
       </template>
     </div>
 
@@ -818,6 +840,11 @@ async function open(image: GalleryImage): Promise<void> {
 }
 .gal-cleanup-summary p:last-child {
   margin-bottom: 0;
+}
+.gal-cleanup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .gal-warn {
