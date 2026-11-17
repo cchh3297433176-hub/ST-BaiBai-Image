@@ -1,39 +1,65 @@
-import { isImageMissing, markImageMissing } from '@/floor/missingImages';
+import { isImageMissing, isLegacyFloorImage, markImagesMissing } from '@/floor/missingImages';
 import { planChatRetention, type ImageReferencePlan, type ImageRetentionPolicy } from '@/floor/retentionPolicy';
 import { deleteImageFileOnly } from '@/floor/storage';
+import { deleteUploadedFile } from '@/floor/upload';
+import { mapLimit } from '@/pool';
 import { settings } from '@/state/settings';
 import { getContext, type STContext, type STMessage } from '@/st/context';
 import { listUserImageFolders, listUserImages, probeUserImage } from '@/st/images';
-import { watch } from 'vue';
+import { computed, shallowRef, watch } from 'vue';
 
 type SavedChat = { id: string; avatar?: string };
+type Phase = 'scanning' | 'confirming' | 'verifying' | 'deleting';
+type Progress = { phase: Phase; automatic: boolean; done?: number; total?: number };
 
-export interface RetentionPreview {
-  paths: readonly string[];
-  bytes: number;
-  unknownSizes: number;
+export interface RetentionResult {
+  deleted: number;
+  failed: number;
+  interrupted?: string;
 }
 
 const DAY = 86_400_000;
-const AUTOMATIC_INTERVAL = 60 * 60 * 1000;
-const AUTOMATIC_DELAY = 90_000;
+const AUTOMATIC_INTERVAL = 10 * 60_000;
+const AUTOMATIC_DELAY = 30_000;
+const CHAT_CONCURRENCY = 3;
+const FILE_CONCURRENCY = 6;
+const FILE_VERIFY_BATCH = 250;
+const SCAN_TIMEOUT = 45_000;
 let revision = 0;
 let bound = false;
-let busy = false;
-let lastSweep = 0;
+let lastSweep: { time: number; revision: number; policy: ImageRetentionPolicy } | undefined;
 let hostDateParser: ((value: string) => { valueOf(): number }) | undefined;
 
-function pause(ms = 20): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+const progress = shallowRef<Progress>();
+export const imageRetentionProgress = computed(() => progress.value);
+export const imageRetentionStatus = computed(() => {
+  const state = progress.value;
+  if (!state) return '';
+  const labels = {
+    scanning: '正在检索',
+    confirming: '等待确认',
+    verifying: '正在复核',
+    deleting: '正在删除',
+  };
+  const label = labels[state.phase];
+  return state.total ? `${label} ${state.done}/${state.total}` : label;
+});
+
+function setProgress(phase: Phase, done?: number, total?: number): void {
+  progress.value = { phase, automatic: progress.value?.automatic ?? false, done, total };
 }
 
-async function post(ctx: STContext, route: string, body: object): Promise<unknown> {
-  const response = await fetch(route, {
+async function post(ctx: STContext, route: string, body: object): Promise<Response> {
+  return fetch(route, {
     method: 'POST',
     headers: ctx.getRequestHeaders(),
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(45_000),
+    signal: AbortSignal.timeout(SCAN_TIMEOUT),
   });
+}
+
+async function readJson(ctx: STContext, route: string, body: object): Promise<unknown> {
+  const response = await post(ctx, route, body);
   if (!response.ok) throw new Error('读取聊天失败（HTTP ' + response.status + '）');
   return response.json();
 }
@@ -50,33 +76,56 @@ function chatKey(chat: SavedChat): string {
   return JSON.stringify([chat.avatar ?? null, chat.id]);
 }
 
-async function* savedChats(ctx: STContext, stillValid: () => void): AsyncGenerator<SavedChat> {
-  // simple 只列文件名；逐张角色卡查，避免 /chats/recent 在手机上并发读取整个聊天库。
-  for (const avatar of new Set(ctx.characters?.map(character => character.avatar).filter(Boolean))) {
-    await pause();
-    stillValid();
-    const result = await post(ctx, '/api/characters/chats', { avatar_url: avatar, simple: true });
-    if (result && typeof result === 'object' && 'error' in result && result.error === true) continue;
-    if (!Array.isArray(result)) throw new Error('酒馆未返回可识别的聊天列表');
-    for (const chat of result) {
-      if (typeof chat?.file_id !== 'string') throw new Error('酒馆返回了无法识别的聊天文件名');
-      yield { id: chat.file_id, avatar };
+/** 遇到读取错误就停止领新任务，等已发出的读取结束后再释放清理锁。 */
+async function scanInParallel<T, R>(
+  items: readonly T[], limit: number, valid: () => void, read: (item: T) => Promise<R>,
+): Promise<R[]> {
+  let failure: { error: unknown } | undefined;
+  const results = await mapLimit(items, limit, async item => {
+    if (failure) return;
+    try {
+      valid();
+      return await read(item);
+    } catch (error) {
+      failure = { error };
     }
-  }
+  });
+  if (failure) throw failure.error;
+  valid();
+  return results as R[];
+}
 
-  // 群聊记录由宿主维护；同一文件可能被重复列出，调用层会去重。
+async function savedChats(ctx: STContext, active: SavedChat | undefined, valid: () => void): Promise<SavedChat[]> {
+  const avatars = [...new Set(ctx.characters?.map(character => character.avatar).filter(Boolean))];
+  const lists = await scanInParallel(avatars, CHAT_CONCURRENCY, valid, async avatar => {
+    // simple 只列文件名，避免让宿主为了列目录读入每一个大聊天。
+    const result = await readJson(ctx, '/api/characters/chats', { avatar_url: avatar, simple: true });
+    if (result && typeof result === 'object' && 'error' in result && result.error === true) return [];
+    if (!Array.isArray(result)) throw new Error('酒馆未返回可识别的聊天列表');
+    return result.map(chat => {
+      if (typeof chat?.file_id !== 'string') throw new Error('酒馆返回了无法识别的聊天文件名');
+      return { id: chat.file_id, avatar };
+    });
+  });
+  const chats = new Map<string, SavedChat>();
+  for (const list of lists) {
+    for (const chat of list) chats.set(chatKey(chat), chat);
+  }
   for (const group of ctx.groups ?? []) {
     for (const id of group.chats ?? []) {
       if (typeof id !== 'string') throw new Error('酒馆返回了无法识别的群聊文件名');
-      yield { id };
+      const chat = { id };
+      chats.set(chatKey(chat), chat);
     }
   }
+  if (active) chats.delete(chatKey(active));
+  return [...chats.values()];
 }
 
 async function readChat(ctx: STContext, chat: SavedChat): Promise<STMessage[]> {
   const result = chat.avatar
-    ? await post(ctx, '/api/chats/get', { avatar_url: chat.avatar, file_name: chat.id })
-    : await post(ctx, '/api/chats/group/get', { id: chat.id });
+    ? await readJson(ctx, '/api/chats/get', { avatar_url: chat.avatar, file_name: chat.id })
+    : await readJson(ctx, '/api/chats/group/get', { id: chat.id });
   if (!Array.isArray(result)) throw new Error('无法完整读取历史聊天');
   return result.filter(message => message && typeof message.mes === 'string');
 }
@@ -87,75 +136,106 @@ function isIdle(chat: readonly STMessage[], now: number, days: number): boolean 
     if (!value) continue;
     const nativeTime = /^\d+$/.test(String(value)) ? Number(value) : Date.parse(value);
     const time = Number.isFinite(nativeTime) ? nativeTime : hostDateParser?.(value).valueOf();
-    // 日期不明时按活跃会话处理，保留完整的最近 N 楼。
     return typeof time === 'number' && Number.isFinite(time) && now - time >= days * DAY;
   }
   return false;
 }
 
-function assertStable(expected: number): void {
-  if (revision !== expected) throw new Error('聊天刚刚发生变化，请重新预览');
+function assertEnabled(): void {
+  if (!settings.enabled) throw new Error('柏宝绘已停用');
 }
 
 function isGenerating(): boolean {
-  // ST 只在实际锁住发送按钮时设置这个标记。生成开始事件也会在试算提示词、
-  // 执行斜杠指令前触发，这些路径可能没有对应的结束事件。
   return typeof document !== 'undefined' && document.body?.dataset.generating === 'true';
 }
 
-async function findExpiredImages(policy: ImageRetentionPolicy, valid: () => void): Promise<string[]> {
-  const ctx = getContext();
-  if (!ctx?.characters || !Array.isArray(ctx.groups)) throw new Error('酒馆的角色和群聊列表尚未就绪');
+function assertCanDelete(snapshot: number): void {
+  assertEnabled();
+  if (revision !== snapshot) throw new Error('聊天刚刚发生变化，请重新清理');
+  if (isGenerating()) throw new Error('酒馆正在生成回复，请等回复结束后再清理旧图');
+}
+
+async function findExpiredReferences(
+  ctx: STContext, policy: ImageRetentionPolicy, valid: () => void,
+  phase: 'scanning' | 'verifying', candidates?: ReadonlySet<string>,
+): Promise<string[]> {
+  if (!ctx.characters || !Array.isArray(ctx.groups)) throw new Error('酒馆的角色和群聊列表尚未就绪');
+  setProgress(phase);
   const utilsUrl = '/scripts/utils.js';
   if (!hostDateParser && typeof window !== 'undefined') {
     const utils = await import(/* @vite-ignore */ utilsUrl).catch(() => null);
     if (typeof utils?.timestampToMoment === 'function') hostDateParser = utils.timestampToMoment;
   }
+  valid();
   const active = currentChat(ctx);
-  const seen = new Set(active ? [chatKey(active)] : []);
-  const plan: ImageReferencePlan = { keep: new Set(), expire: new Set() };
+  const plan: ImageReferencePlan = { keep: new Set(), expire: new Set(), candidates };
   const now = Date.now();
   planChatRetention(ctx.chat, policy.keepFloors, false, plan);
-  for await (const next of savedChats(ctx, valid)) {
-    const key = chatKey(next);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    await pause();
-    valid();
-    const messages = await readChat(ctx, next);
+  const chats = await savedChats(ctx, active, valid);
+  let checked = 0;
+  setProgress(phase, checked, chats.length);
+  await scanInParallel(chats, CHAT_CONCURRENCY, valid, async chat => {
+    const messages = await readChat(ctx, chat);
     planChatRetention(messages, policy.keepFloors, isIdle(messages, now, policy.idleDays), plan);
-  }
-  valid();
+    setProgress(phase, ++checked, chats.length);
+  });
+  return [...plan.expire].filter(path => !plan.keep.has(path) && !isImageMissing(path));
+}
 
+async function existingImages(ctx: STContext, paths: readonly string[], valid: () => void): Promise<string[]> {
   const byFolder = new Map<string, Map<string, string>>();
-  for (const path of plan.expire) {
-    if (plan.keep.has(path) || isImageMissing(path)) continue;
+  const legacy: string[] = [];
+  for (const path of paths) {
+    if (isLegacyFloorImage(path)) {
+      legacy.push(path);
+      continue;
+    }
     const [, , folder, file] = path.split('/');
     const files = byFolder.get(folder) ?? new Map();
     files.set(file, path);
     byFolder.set(folder, files);
   }
-  if (!byFolder.size) return [];
 
-  const existingFolders = await listUserImageFolders();
-  const expired: string[] = [];
-  for (const folder of existingFolders) {
-    const candidates = byFolder.get(folder);
-    if (!candidates) continue;
-    await pause();
+  setProgress('scanning');
+  const existing = new Set<string>();
+  if (byFolder.size) {
+    const folders = (await listUserImageFolders(AbortSignal.timeout(SCAN_TIMEOUT))).filter(folder => byFolder.has(folder));
+    await scanInParallel(folders, CHAT_CONCURRENCY, valid, async folder => {
+      const candidates = byFolder.get(folder)!;
+      // 按名称列图，宿主不用为按日期排序逐张 stat。
+      const files = await listUserImages(folder, { sortField: 'name', signal: AbortSignal.timeout(SCAN_TIMEOUT) });
+      for (const file of files) {
+        const path = candidates.get(file);
+        if (path) existing.add(path);
+      }
+    });
+  }
+  for (let i = 0; i < legacy.length; i += FILE_VERIFY_BATCH) {
     valid();
-    for (const file of await listUserImages(folder)) {
-      const path = candidates.get(file);
-      if (path) expired.push(path);
+    const batch = legacy.slice(i, i + FILE_VERIFY_BATCH);
+    const response = await post(ctx, '/api/files/verify', { urls: batch });
+    if (response.status === 404 || response.status === 405) {
+      // 某些旧版宿主没有批量验证接口。
+      await scanInParallel(legacy, FILE_CONCURRENCY, valid, async path => {
+        const probe = await probeUserImage('/' + path);
+        if (probe?.exists !== false) existing.add(path);
+      });
+      break;
+    }
+    if (!response.ok) throw new Error('检查旧版图片失败（HTTP ' + response.status + '）');
+    const verified = await response.json();
+    for (const path of batch) {
+      if (typeof verified?.[path] !== 'boolean') throw new Error('酒馆未返回可识别的旧版图片状态');
+      if (verified[path]) existing.add(path);
     }
   }
   valid();
-  return expired;
+  return paths.filter(path => existing.has(path));
 }
 
-async function withCleanupLock<T>(task: () => Promise<T>): Promise<T> {
-  if (busy) throw new Error('正在检查历史图片');
-  busy = true;
+async function withCleanupLock<T>(automatic: boolean, task: () => Promise<T>): Promise<T> {
+  if (progress.value) throw new Error('柏宝绘正在清理旧图');
+  progress.value = { phase: 'scanning', automatic };
   try {
     if (!navigator.locks) return await task();
     return await navigator.locks.request('st-baibai-image-retention', { ifAvailable: true }, async lock => {
@@ -163,107 +243,125 @@ async function withCleanupLock<T>(task: () => Promise<T>): Promise<T> {
       return task();
     });
   } finally {
-    busy = false;
+    progress.value = undefined;
   }
 }
 
-export function previewImageRetention(policy: ImageRetentionPolicy): Promise<RetentionPreview> {
-  return withCleanupLock(async () => {
-    const snapshot = revision;
-    const valid = () => assertStable(snapshot);
-    valid();
-    const paths = await findExpiredImages(policy, valid);
-    let bytes = 0;
-    let unknownSizes = 0;
-    const existing: string[] = [];
-    for (let i = 0; i < paths.length; i += 4) {
-      await pause();
+async function deletePaths(paths: readonly string[], valid: () => void): Promise<RetentionResult> {
+  const confirmedMissing: string[] = [];
+  const result: RetentionResult = { deleted: 0, failed: 0 };
+  let processed = 0;
+  setProgress('deleting', processed, paths.length);
+  await mapLimit(paths, FILE_CONCURRENCY, async path => {
+    if (result.interrupted) return;
+    try {
       valid();
-      const batch = paths.slice(i, i + 4);
-      const probes = await Promise.all(batch.map(path => probeUserImage('/' + path.split('/').map(encodeURIComponent).join('/'))));
-      for (const [index, probe] of probes.entries()) {
-        if (probe?.exists === false) continue;
-        existing.push(batch[index]);
-        if (probe?.exists && probe.size !== null) bytes += probe.size;
-        else unknownSizes++;
-      }
+    } catch (error) {
+      result.interrupted = error instanceof Error ? error.message : String(error);
+      return;
     }
-    valid();
-    return { paths: existing, bytes, unknownSizes };
+    try {
+      const signal = AbortSignal.timeout(30_000);
+      const deleted = isLegacyFloorImage(path) ? await deleteUploadedFile(path, signal) : await deleteImageFileOnly(path, signal);
+      confirmedMissing.push(path);
+      if (deleted) result.deleted++;
+    } catch (error) {
+      result.failed++;
+      console.warn('[柏宝绘] 删除旧图失败', path, error);
+    }
+    setProgress('deleting', ++processed, paths.length);
   });
+  markImagesMissing(confirmedMissing);
+  return result;
 }
 
-async function deletePaths(paths: readonly string[], valid: () => void): Promise<number> {
-  let deleted = 0;
-  for (const path of paths) {
-    await pause();
-    valid();
-    await deleteImageFileOnly(path);
-    markImageMissing(path);
-    deleted++;
-  }
-  return deleted;
+function sameRules(a: ImageRetentionPolicy, b: ImageRetentionPolicy): boolean {
+  return a.keepFloors === b.keepFloors && a.idleDays === b.idleDays;
 }
 
-/** 重新计算保留范围，且只处理预览里已经确认的文件。 */
-export function applyImageRetention(preview: RetentionPreview, policy: ImageRetentionPolicy): Promise<number> {
-  return withCleanupLock(async () => {
-    const snapshot = revision;
-    const valid = () => {
-      assertStable(snapshot);
-      if (!settings.enabled) throw new Error('柏宝绘已停用');
-      if (isGenerating()) throw new Error('酒馆正在生成回复，请等回复结束后再清理旧图');
-    };
-    valid();
-    const previewed = new Set(preview.paths);
-    lastSweep = Date.now();
-    if (!previewed.size) return 0;
-    // 重新检查磁盘上的会话与分支，防止预览后另一设备新增保留引用。
-    const stillExpired = await findExpiredImages(policy, valid);
-    return deletePaths(stillExpired.filter(path => previewed.has(path)), valid);
+export function retentionResultText(result: RetentionResult): string {
+  const parts = [];
+  if (result.deleted) parts.push(`已删除 ${result.deleted} 张旧图`);
+  if (result.failed) parts.push(`${result.failed} 张删除失败`);
+  if (result.interrupted) parts.push(result.interrupted);
+  return parts.length ? parts.join('，') + '。' : '没有符合规则且仍存在的旧图。';
+}
+
+/** 一次清理包含检索、确认与删除，生命周期独立于图库和设置页。 */
+export function runImageRetention(
+  policy: ImageRetentionPolicy, confirm: (count: number) => Promise<boolean>,
+): Promise<RetentionResult | undefined> {
+  return withCleanupLock(false, async () => {
+    const ctx = getContext();
+    if (!ctx) throw new Error('酒馆尚未就绪');
+    const previewRevision = revision;
+    const expired = await findExpiredReferences(ctx, policy, assertEnabled, 'scanning');
+    const paths = await existingImages(ctx, expired, assertEnabled);
+    setProgress('confirming');
+    if (!await confirm(paths.length)) return;
+
+    const confirmedRevision = revision;
+    const canDelete = () => assertCanDelete(confirmedRevision);
+    canDelete();
+    // 只复核已确认路径的聊天引用。文件若已被别处删除，删除接口会返回 404。
+    const confirmedContext = getContext();
+    if (!confirmedContext) throw new Error('酒馆尚未就绪');
+    const result = paths.length
+      ? await deletePaths(await findExpiredReferences(confirmedContext, policy, canDelete, 'verifying', new Set(paths)), canDelete)
+      : { deleted: 0, failed: 0 };
+    if (!result.failed && !result.interrupted && previewRevision === confirmedRevision) {
+      lastSweep = { time: Date.now(), revision: confirmedRevision, policy };
+    }
+    return result;
   });
-}
-
-function isComposing(): boolean {
-  return document.visibilityState === 'hidden'
-    || Boolean(document.activeElement?.matches('#send_textarea, .edit_textarea, [contenteditable="true"]'));
 }
 
 export function bindImageRetention(): void {
   const ctx = getContext();
   if (bound || !ctx) return;
   bound = true;
-  let lastCompletedRevision = -1;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let scheduledAt = 0;
 
   const schedule = () => {
-    if (timer !== undefined) clearTimeout(timer);
-    if (!settings.enabled || !settings.storage.retention.enabled) return;
+    if (!settings.enabled || !settings.storage.retention.enabled) {
+      clearTimeout(timer);
+      timer = undefined;
+      return;
+    }
+    const now = Date.now();
+    const interval = lastSweep?.revision === revision ? DAY : AUTOMATIC_INTERVAL;
+    const nextSweep = lastSweep && sameRules(settings.storage.retention, lastSweep.policy) ? lastSweep.time + interval : 0;
+    const next = Math.max(now + AUTOMATIC_DELAY, nextSweep);
+    // 持续聊天时保留已排好的时间，避免每条消息都把清理往后推。
+    if (timer !== undefined && scheduledAt <= next) return;
+    clearTimeout(timer);
+    scheduledAt = next;
     timer = setTimeout(() => {
       timer = undefined;
       if (!settings.enabled || !settings.storage.retention.enabled) return;
-      if (isComposing() || isGenerating() || busy) {
+      if (progress.value || isGenerating()) {
         schedule();
         return;
       }
-      lastSweep = Date.now();
-      const snapshot = revision;
       const policy = { ...settings.storage.retention };
+      const snapshot = revision;
       const valid = () => {
-        assertStable(snapshot);
+        assertCanDelete(snapshot);
         const current = settings.storage.retention;
-        if (isComposing() || isGenerating() || !settings.enabled || !current.enabled
-          || policy.keepFloors !== current.keepFloors || policy.idleDays !== current.idleDays) {
-          throw new Error('旧图清理已暂停');
-        }
+        if (!current.enabled || !sameRules(current, policy)) throw new Error('旧图清理规则已变更或暂停');
       };
-      void withCleanupLock(async () => {
-        const paths = await findExpiredImages(policy, valid);
-        await deletePaths(paths, valid);
-        lastCompletedRevision = snapshot;
+      void withCleanupLock(true, async () => {
+        const current = getContext();
+        if (!current) throw new Error('酒馆尚未就绪');
+        const paths = await findExpiredReferences(current, policy, valid, 'scanning');
+        const result = await deletePaths(await existingImages(current, paths, valid), valid);
+        if (!result.failed && !result.interrupted) {
+          lastSweep = { time: Date.now(), revision: snapshot, policy };
+        }
       }).catch(error => console.debug('[柏宝绘] 旧图清理稍后重试', error))
         .finally(schedule);
-    }, Math.max(AUTOMATIC_DELAY, lastSweep + (lastCompletedRevision === revision ? DAY : AUTOMATIC_INTERVAL) - Date.now()));
+    }, next - now);
   };
 
   const invalidate = () => {
@@ -279,7 +377,6 @@ export function bindImageRetention(): void {
     if (event) ctx.eventSource.on(event, invalidate);
   }
 
-  // 在设定页首次确认后启动；以后由启动、活动变化与低频定时器驱动。
   watch(
     () => [settings.enabled, settings.storage.retention.enabled,
       settings.storage.retention.keepFloors, settings.storage.retention.idleDays],

@@ -12,7 +12,7 @@ import { settings } from '@/state/settings';
  *
  * 两层分离：
  * - 新图片二进制 → ST 文件系统（user/images/柏宝绘_<角色名>/），extra 只存指针 path。
- *   旧 user/files 图片保留原位，不迁移、不删除。
+ *   旧 user/files 图片保留原位，可由旧图清理按楼层规则处理。
  * - 元数据 → message.extra.bbiImage = { [swipeId]: { [promptHash]: BbiImageEntry[] } }
  *   按 swipeId 分桶（滑动互不污染）；promptHash 键下是历史列表（时间正序，
  *   最新在末尾，卡片翻页浏览）；水合时用当前 tag 原文重算 hash 做 stale 检测。
@@ -474,16 +474,17 @@ export async function saveImageResult(
  * 编码路径传过去只会 404,还会被 deleteUserImage 当成「本就不存在」静默吞掉——
  * 症状就是图没删掉、侧写却真删了。
  */
-export async function deleteImageFileOnly(path: string): Promise<void> {
+export async function deleteImageFileOnly(path: string, signal?: AbortSignal): Promise<boolean> {
   const target = normalizeImagePath(path);
-  await deleteUserImage(target);
+  const deleted = await deleteUserImage(target, signal);
   const sidecar = sidecarPathFor(target);
-  if (!sidecar) return;
+  if (!sidecar) return deleted;
   try {
-    await deleteUploadedFile(sidecar);
+    await deleteUploadedFile(sidecar, signal);
   } catch (error) {
     console.warn('[柏宝绘] 删除侧写元数据失败（留作孤儿）', error);
   }
+  return deleted;
 }
 
 /**

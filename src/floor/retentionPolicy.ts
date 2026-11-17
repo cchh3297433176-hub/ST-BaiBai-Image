@@ -1,4 +1,4 @@
-import { normalizeImagePath } from '@/floor/missingImages';
+import { isLegacyFloorImage, normalizeImagePath } from '@/floor/missingImages';
 import { isAiStoryMessage, type STMessage } from '@/st/context';
 
 export interface ImageRetentionPolicy {
@@ -36,7 +36,7 @@ function ownedImagePath(value: unknown): string | undefined {
   if (typeof value !== 'string') return;
   const path = normalizeImagePath(value);
   // 目录和文件名同时核对。公开接口存图用同一目录，但不写入楼层 bbiImage。
-  if (/^user\/images\/柏宝绘_[^/\\\x00-\x1f]+\/bbi_[a-z0-9_]+-[a-z0-9]+\.(?:png|jpe?g|webp|gif|avif)$/i.test(path)) {
+  if (isLegacyFloorImage(path) || /^user\/images\/柏宝绘_[^/\\\x00-\x1f]+\/bbi_[a-z0-9_]+-[a-z0-9]+\.(?:png|jpe?g|webp|gif|avif)$/i.test(path)) {
     return path;
   }
 }
@@ -61,6 +61,7 @@ function storedPaths(extra: Record<string, unknown> | undefined): string[] {
 export interface ImageReferencePlan {
   keep: Set<string>;
   expire: Set<string>;
+  candidates?: ReadonlySet<string>;
 }
 
 /**
@@ -87,6 +88,8 @@ export function planChatRetention(
       keep = idle ? !keptIdleFloor : i >= cutoff;
       keptIdleFloor = true;
     }
-    for (const path of paths) (keep ? plan.keep : plan.expire).add(path);
+    for (const path of paths) {
+      if (!plan.candidates || plan.candidates.has(path)) (keep ? plan.keep : plan.expire).add(path);
+    }
   }
 }

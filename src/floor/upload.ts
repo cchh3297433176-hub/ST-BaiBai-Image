@@ -15,13 +15,14 @@ export class FileStoreError extends Error {
   }
 }
 
-async function postFile(endpoint: string, body: Record<string, unknown>): Promise<{ ok: boolean; status: number; text: string }> {
+async function postFile(endpoint: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<{ ok: boolean; status: number; text: string }> {
   const ctx = getContext();
   if (!ctx) throw new FileStoreError('SillyTavern 上下文不可用');
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: ctx.getRequestHeaders(),
     body: JSON.stringify(body),
+    ...(signal && { signal }),
   });
   const text = await response.text().catch(() => '');
   return { ok: response.ok, status: response.status, text };
@@ -50,8 +51,8 @@ export function uploadImageFile(name: string, base64: string): Promise<string> {
 }
 
 /** 删除已上传文件。返回 false 表示文件本就不存在（无需清理）。 */
-export async function deleteUploadedFile(path: string): Promise<boolean> {
-  const { ok, status, text } = await postFile('/api/files/delete', { path });
+export async function deleteUploadedFile(path: string, signal?: AbortSignal): Promise<boolean> {
+  const { ok, status, text } = await postFile('/api/files/delete', { path }, signal);
   if (ok) return true;
   if (status === 404) return false;
   throw new FileStoreError(`文件删除失败 (${status})${text ? `：${text.slice(0, 300)}` : ''}`, status);

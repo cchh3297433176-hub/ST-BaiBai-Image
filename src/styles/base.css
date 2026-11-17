@@ -578,3 +578,20 @@
     font-size: 12px;
   }
 }
+
+.bbi-spin {
+  animation: bbi-spin 0.9s linear infinite;
+  color: var(--bbi-accent);
+}
+
+@keyframes bbi-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bbi-spin {
+    animation: none;
+  }
+}

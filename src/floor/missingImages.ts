@@ -39,6 +39,11 @@ export function normalizeImagePath(path: string): string {
   return decoded.replace(/^\/+/, '');
 }
 
+/** 0.2.4 之前的楼层插图使用平铺的 user/files 目录。 */
+export function isLegacyFloorImage(path: string): boolean {
+  return /^user\/files\/bbi_[a-f0-9]{14}_\d+_[a-f0-9]{14}-g[a-z0-9]+\.(?:png|jpe?g|webp|gif|avif)$/i.test(path);
+}
+
 /** 记下这张图的文件已经没了(调用方须先确认确实是 404,别把网络抖动记成删除)。 */
 export function markImageMissing(path: string): void {
   if (path) missing.add(normalizeImagePath(path));
@@ -64,11 +69,12 @@ const probing = new Set<string>();
  * 故这里补一次 HEAD:只有服务端明确说 404 才落册,分不清(probe 返回 null)就什么都不做,
  * 让浏览器的破图占位留着,下次重挂时自然重试。
  *
- * 只认 user/images 下的图:user/files 里的老图本插件不删,没有「被图库删掉」这条路径。
+ * 只认图库图片与旧版柏宝绘的平铺楼层插图。
  */
 export async function confirmImageMissing(path: string): Promise<boolean> {
-  if (!path || !/^\/?user\/images\//.test(normalizeImagePath(path))) return false;
+  if (!path) return false;
   const key = normalizeImagePath(path);
+  if (!key.startsWith('user/images/') && !isLegacyFloorImage(key)) return false;
   if (missing.has(key)) return true;
   if (probing.has(key)) return false;
   probing.add(key);

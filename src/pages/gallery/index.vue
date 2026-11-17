@@ -4,8 +4,8 @@ import Icon from '@/components/Icon.vue';
 import { confirmDialog } from '@/components/confirm';
 import { imageDownloadFileName } from '@/floor/download';
 import { openLightbox } from '@/floor/lightbox';
-import { markImagesMissing, normalizeImagePath } from '@/floor/missingImages';
-import { applyImageRetention, previewImageRetention } from '@/floor/retention';
+import { isImageMissing, markImagesMissing, normalizeImagePath } from '@/floor/missingImages';
+import { imageRetentionProgress, imageRetentionStatus, retentionResultText, runImageRetention } from '@/floor/retention';
 import { deleteImageFileOnly, readStore, sidecarPathFor, type BbiImageSidecar } from '@/floor/storage';
 import { formatGenerationMeta, type GenerationMeta } from '@/generationMeta';
 import { mapLimit } from '@/pool';
@@ -65,7 +65,10 @@ interface GalleryGroup {
   images: GalleryImage[];
 }
 
-const groups = ref<GalleryGroup[]>([]);
+const loadedGroups = ref<GalleryGroup[]>([]);
+const groups = computed(() => loadedGroups.value
+  .map(group => ({ ...group, images: group.images.filter(image => !isImageMissing(image.key)) }))
+  .filter(group => group.images.length > 0));
 const loading = ref(false);
 const error = ref('');
 /** 部分目录读取失败的条数:整页不失败,但要如实说明少了几组。 */
@@ -201,7 +204,7 @@ async function load(): Promise<void> {
       const rank = Number(b.name === current) - Number(a.name === current);
       return rank || collator.compare(a.name, b.name);
     });
-    groups.value = next;
+    loadedGroups.value = next;
     // ⚠ 暂时禁用分组体积统计:作者不满意当前方案——逐张 HEAD 读 Content-Length,
     // 请求数随图库规模线性增长,进一次图库就是几百上千个后台请求。
     // 体积相关的计算、模板、CSS 与测试全部原样保留,恢复时解注下面这一行即可。
@@ -372,7 +375,6 @@ const selecting = ref(false);
 /** 已勾选的图(归一化路径 key,跨分组唯一)。 */
 const selected = ref(new Set<string>());
 const deleting = ref(false);
-const cleanupStatus = ref('');
 
 const selectedCount = computed(() => selected.value.size);
 
@@ -422,7 +424,7 @@ function onThumbClick(image: GalleryImage): void {
  * 就地从列表摘掉(不重新 load,免得把用户的展开态和已加载批次全重置)、清理体积缓存。
  */
 async function deleteSelected(): Promise<void> {
-  if (!selectedCount.value || deleting.value || cleanupStatus.value) return;
+  if (!selectedCount.value || deleting.value || imageRetentionProgress.value) return;
   const targets = groups.value
     .flatMap(group => group.images)
     .filter(image => selected.value.has(image.key));
@@ -458,12 +460,8 @@ async function deleteSelected(): Promise<void> {
     const failed = results.length - done.size;
 
     if (done.size) {
-      // 已打开的楼层卡片据此立刻降级(key 本就是归一化路径,与 missingImages 同口径)
+      // 图库与已打开的楼层卡片据此更新，保留图库展开状态。
       markImagesMissing(done);
-      // 就地摘除:不 load(),否则用户的展开态与已加载批次全被重置
-      groups.value = groups.value
-        .map(group => ({ ...group, images: group.images.filter(image => !done.has(image.key)) }))
-        .filter(group => group.images.length > 0);
       const nextSizes = new Map(sizes.value);
       done.forEach(key => nextSizes.delete(key));
       sizes.value = nextSizes;
@@ -480,37 +478,28 @@ async function deleteSelected(): Promise<void> {
 }
 
 async function cleanupOldImages(): Promise<void> {
-  if (cleanupStatus.value || selecting.value || deleting.value || !settings.enabled) return;
-  cleanupStatus.value = '正在检查旧图…';
+  if (imageRetentionProgress.value || selecting.value || deleting.value || !settings.enabled) return;
   try {
     const policy = { ...settings.storage.retention };
-    const preview = await previewImageRetention(policy);
-    if (!preview.paths.length) {
-      toastr.info('没有符合已保存规则的旧图。', '柏宝绘');
-      return;
-    }
-
-    const unknown = preview.unknownSizes ? `另有 ${preview.unknownSizes} 张大小未知。` : '';
-    const ok = await confirmDialog({
-      title: '清理旧图',
-      text: `按已保存的规则检查角色和群聊。活跃聊天保留最近 ${policy.keepFloors} 个 AI 楼的插图，闲置 ${policy.idleDays} 天的聊天保留最后一个有图楼。\n\n` +
-        `符合规则的旧图共有 ${preview.paths.length} 张，已统计 ${formatBytes(preview.bytes)}。${unknown}确认后删除这些图片文件。`,
-      confirmText: '清理这批旧图',
-      tone: 'danger',
+    const result = await runImageRetention(policy, count => {
+      if (!count) {
+        toastr.info('没有符合已保存规则的旧图。', '柏宝绘');
+        return Promise.resolve(false);
+      }
+      return confirmDialog({
+        title: '清理旧图',
+        text: `找到 ${count} 张旧图。活跃聊天保留最近 ${policy.keepFloors} 个 AI 楼的插图，闲置 ${policy.idleDays} 天的聊天保留最后一个有图楼。确认后删除这些图片文件。`,
+        confirmText: '清理这批旧图',
+        tone: 'danger',
+      });
     });
-    if (!ok) return;
-
-    cleanupStatus.value = '正在清理旧图…';
-    try {
-      const deleted = await applyImageRetention(preview, policy);
-      toastr.success(deleted ? `已清理 ${deleted} 张旧图` : '重新核对后没有旧图可清理。', '柏宝绘');
-    } finally {
-      await load();
+    if (result) {
+      const message = retentionResultText(result);
+      if (result.failed || result.interrupted) toastr.warning(message, '柏宝绘');
+      else toastr.success(message, '柏宝绘');
     }
   } catch (error) {
     toastr.error(error instanceof Error ? error.message : String(error), '柏宝绘');
-  } finally {
-    cleanupStatus.value = '';
   }
 }
 
@@ -544,10 +533,11 @@ async function open(image: GalleryImage): Promise<void> {
     <div class="bbi-page-head">
       <h2 class="bbi-title bbi-title-sub">图库</h2>
       <div class="gal-head-actions">
-        <button class="bbi-btn bbi-btn-sm" type="button" :disabled="loading || selecting || deleting || !!cleanupStatus || !settings.enabled" @click="cleanupOldImages">
-          {{ cleanupStatus || '清理旧图' }}
+        <button class="bbi-btn bbi-btn-sm" type="button" :disabled="loading || selecting || deleting || !!imageRetentionProgress || !settings.enabled" @click="cleanupOldImages">
+          <Icon v-if="imageRetentionProgress && imageRetentionProgress.phase !== 'confirming'" name="refresh" class="bbi-spin" />
+          <span role="status">{{ imageRetentionStatus || '清理旧图' }}</span>
         </button>
-        <button class="gal-icon-btn" type="button" title="重新读取" :disabled="loading || !!cleanupStatus" @click="load">
+        <button class="gal-icon-btn" type="button" title="重新读取" :disabled="loading || !!imageRetentionProgress" @click="load">
           <Icon name="refresh" />
         </button>
       </div>
@@ -561,7 +551,7 @@ async function open(image: GalleryImage): Promise<void> {
         class="bbi-btn bbi-btn-sm gal-select-toggle"
         :class="{ 'is-on': selecting }"
         type="button"
-        :disabled="!groups.length || !!cleanupStatus"
+        :disabled="!groups.length || !!imageRetentionProgress"
         :title="selecting ? '退出选择' : '选择图片以批量删除'"
         @click="toggleSelecting"
       >
@@ -583,7 +573,7 @@ async function open(image: GalleryImage): Promise<void> {
       <button
         class="bbi-btn bbi-btn-sm"
         type="button"
-        :disabled="!selectedCount || deleting || !!cleanupStatus"
+        :disabled="!selectedCount || deleting || !!imageRetentionProgress"
         @click="selected = new Set()"
       >
         清空
@@ -591,7 +581,7 @@ async function open(image: GalleryImage): Promise<void> {
       <button
         class="bbi-btn bbi-btn-sm bbi-btn-danger"
         type="button"
-        :disabled="!selectedCount || deleting || !!cleanupStatus"
+        :disabled="!selectedCount || deleting || !!imageRetentionProgress"
         @click="deleteSelected"
       >
         <Icon name="trash" />
@@ -605,7 +595,7 @@ async function open(image: GalleryImage): Promise<void> {
 
     <!-- 读取中 / 出错 / 空 / 列表 -->
     <div v-if="loading && !groups.length" class="gal-state">
-      <Icon name="refresh" :size="26" class="gal-spin" />
+      <Icon name="refresh" :size="26" class="bbi-spin" />
       <p class="gal-state-title">正在读取图库…</p>
     </div>
 
@@ -810,20 +800,6 @@ async function open(image: GalleryImage): Promise<void> {
   text-align: center;
   font-size: 13px;
   color: var(--bbi-ink-muted);
-}
-.gal-spin {
-  animation: gal-rotate 0.9s linear infinite;
-  color: var(--bbi-accent);
-}
-@keyframes gal-rotate {
-  to {
-    transform: rotate(360deg);
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .gal-spin {
-    animation: none;
-  }
 }
 
 /* —— 分组 —— */

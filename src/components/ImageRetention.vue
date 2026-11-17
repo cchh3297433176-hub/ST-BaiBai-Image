@@ -1,18 +1,15 @@
 <script setup lang="ts">
-import { formatBytes } from '@/bytes';
 import Collapsible from '@/components/Collapsible.vue';
-import ConfirmDialog from '@/components/ConfirmDialog.vue';
-import { applyImageRetention, previewImageRetention, type RetentionPreview } from '@/floor/retention';
+import Icon from '@/components/Icon.vue';
+import { confirmDialog } from '@/components/confirm';
+import { imageRetentionProgress, imageRetentionStatus, retentionResultText, runImageRetention } from '@/floor/retention';
 import type { ImageRetentionPolicy } from '@/floor/retentionPolicy';
 import { settings } from '@/state/settings';
-import { ref, shallowRef, watch } from 'vue';
+import { ref, watch } from 'vue';
 
 const keepFloors = ref<number | string>(settings.storage.retention.keepFloors);
 const idleDays = ref<number | string>(settings.storage.retention.idleDays);
-const open = ref(false);
-const busy = ref(false);
 const status = ref('');
-const pending = shallowRef<{ policy: ImageRetentionPolicy; preview: RetentionPreview }>();
 
 watch(() => settings.storage.retention, current => {
   keepFloors.value = current.keepFloors;
@@ -37,35 +34,25 @@ function saveRules() {
 }
 
 async function preview() {
+  if (imageRetentionProgress.value || !settings.enabled) return;
   const rules = readRules();
   if (!rules) return;
-  busy.value = true;
-  status.value = '正在检查已有聊天和旧图…';
+  status.value = '';
   const policy = { ...rules, enabled: true };
   try {
-    pending.value = { policy, preview: await previewImageRetention(policy) };
-    status.value = '';
-    open.value = true;
+    const result = await runImageRetention(policy, count => confirmDialog({
+      title: rules.enabled ? '更新旧图自动清理规则' : '启用旧图自动清理',
+      text: `找到 ${count} 张符合规则的旧图。确认后清理这些图片文件，并按最近 ${policy.keepFloors} 个 AI 楼、闲置 ${policy.idleDays} 天的规则自动清理。`,
+      confirmText: rules.enabled ? '确认并更新' : '确认并开启',
+      tone: 'danger',
+    }));
+    if (!result) return;
+    settings.storage.retention = policy;
+    const message = retentionResultText(result) + (rules.enabled ? '自动清理规则已更新。' : '自动清理已开启。');
+    if (result.failed || result.interrupted) toastr.warning(message, '柏宝绘');
+    else toastr.success(message, '柏宝绘');
   } catch (error) {
-    status.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function apply() {
-  if (!pending.value || busy.value) return;
-  const selected = pending.value;
-  busy.value = true;
-  try {
-    const deleted = await applyImageRetention(selected.preview, selected.policy);
-    settings.storage.retention = selected.policy;
-    status.value = deleted ? '已处理 ' + deleted + ' 张旧图，自动清理已开启。' : '这次没有旧图可清，自动清理已开启。';
-  } catch (error) {
-    status.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    open.value = false;
-    busy.value = false;
+    toastr.error(error instanceof Error ? error.message : String(error), '柏宝绘');
   }
 }
 
@@ -76,36 +63,26 @@ function disable() {
 </script>
 
 <template>
-  <Collapsible title="旧图自动清理" :open="false">
+  <Collapsible title="旧图自动清理" :open="!!imageRetentionProgress">
     <label class="bbi-num-row">
       <span class="bbi-field-label">最近保留 AI 楼数</span>
-      <input v-model.number="keepFloors" class="bbi-input bbi-num" type="number" inputmode="numeric" min="1" step="1" :disabled="busy" />
+      <input v-model.number="keepFloors" class="bbi-input bbi-num" type="number" inputmode="numeric" min="1" step="1" :disabled="!!imageRetentionProgress" />
     </label>
     <label class="bbi-num-row">
       <span class="bbi-field-label">闲置天数</span>
-      <input v-model.number="idleDays" class="bbi-input bbi-num" type="number" inputmode="numeric" min="1" step="1" :disabled="busy" />
+      <input v-model.number="idleDays" class="bbi-input bbi-num" type="number" inputmode="numeric" min="1" step="1" :disabled="!!imageRetentionProgress" />
     </label>
-    <p class="bbi-field-hint">闲置聊天只留最后一个有图楼里的图片。保存的规则也用于图库里的「清理旧图」。</p>
+    <p class="bbi-field-hint">闲置聊天只保留最后一个有图的 AI 楼。图库的「清理旧图」使用已保存的规则。</p>
     <p v-if="settings.storage.retention.enabled" class="bbi-field-hint">
-      正在使用 {{ settings.storage.retention.keepFloors }} 楼 / {{ settings.storage.retention.idleDays }} 天
+      已开启自动清理 · 最近 {{ settings.storage.retention.keepFloors }} 个 AI 楼 · 闲置 {{ settings.storage.retention.idleDays }} 天
     </p>
-    <button type="button" class="bbi-btn bbi-btn-primary" :disabled="busy || !settings.enabled" @click="preview">预览旧图</button>
-    <button v-if="settings.storage.retention.enabled" type="button" class="bbi-btn" :disabled="busy" @click="disable">暂停自动清理</button>
-    <button v-else type="button" class="bbi-btn" :disabled="busy" @click="saveRules">保存规则</button>
+    <p v-else class="bbi-field-hint">自动清理已关闭。预览并确认后开启。</p>
+    <button type="button" class="bbi-btn bbi-btn-primary" :disabled="!!imageRetentionProgress || !settings.enabled" @click="preview">
+      <Icon v-if="imageRetentionProgress && imageRetentionProgress.phase !== 'confirming'" name="refresh" class="bbi-spin" />
+      <span role="status">{{ imageRetentionStatus || (settings.storage.retention.enabled ? '预览并更新规则' : '预览旧图') }}</span>
+    </button>
+    <button v-if="settings.storage.retention.enabled" type="button" class="bbi-btn" :disabled="!!imageRetentionProgress && !imageRetentionProgress.automatic" @click="disable">暂停自动清理</button>
+    <button v-else type="button" class="bbi-btn" :disabled="!!imageRetentionProgress" @click="saveRules">保存规则</button>
     <p v-if="status" class="bbi-field-hint" role="status">{{ status }}</p>
-
-    <ConfirmDialog
-      v-model:open="open"
-      title="启用旧图自动清理"
-      confirm-text="确认并开启"
-      tone="danger"
-      :busy="busy"
-      busy-text="正在清理…"
-      @confirm="apply"
-    >
-      {{ pending?.preview.paths.length ?? 0 }} 张旧图符合规则，预计释放 {{ formatBytes(pending?.preview.bytes ?? 0) }}。
-      <template v-if="pending?.preview.unknownSizes">另有 {{ pending.preview.unknownSizes }} 张未取得文件大小。</template>
-      确认后会删除这些图片文件。
-    </ConfirmDialog>
   </Collapsible>
 </template>

@@ -6,9 +6,9 @@ import { compileScript, compileTemplate, parse } from 'vue/compiler-sfc';
 import Gallery from './index.vue';
 import { listUserImageFolders, listUserImages, probeUserImage } from '@/st/images';
 import { deleteImageFileOnly } from '@/floor/storage';
-import { isImageMissing, resetMissingImages } from '@/floor/missingImages';
+import { isImageMissing, markImageMissing, resetMissingImages } from '@/floor/missingImages';
 import { openLightbox } from '@/floor/lightbox';
-import { applyImageRetention, previewImageRetention } from '@/floor/retention';
+import { imageRetentionProgress, imageRetentionStatus, runImageRetention } from '@/floor/retention';
 import { confirmDialog } from '@/components/confirm';
 import { settings } from '@/state/settings';
 
@@ -17,10 +17,15 @@ declare const toastr: { success: ReturnType<typeof vi.fn>; error: ReturnType<typ
 vi.mock('@/components/Icon.vue', () => ({ default: () => null }));
 vi.mock('@/components/confirm', () => ({ confirmDialog: vi.fn() }));
 vi.mock('@/floor/lightbox', () => ({ openLightbox: vi.fn() }));
-vi.mock('@/floor/retention', () => ({
-  applyImageRetention: vi.fn(),
-  previewImageRetention: vi.fn(),
-}));
+vi.mock('@/floor/retention', async () => {
+  const { shallowRef } = await import('vue');
+  return {
+    imageRetentionProgress: shallowRef(),
+    imageRetentionStatus: shallowRef(''),
+    runImageRetention: vi.fn(),
+    retentionResultText: () => '已删除 1 张旧图。',
+  };
+});
 vi.mock('@/state/settings', () => ({
   settings: { enabled: true, storage: { retention: { enabled: false, keepFloors: 6, idleDays: 30 } } },
 }));
@@ -163,7 +168,7 @@ beforeEach(() => {
   );
   // 默认每张 1 KB:体积相关断言用得上,其余用例无副作用
   vi.mocked(probeUserImage).mockResolvedValue({ exists: true, size: 1024 });
-  vi.mocked(deleteImageFileOnly).mockResolvedValue(undefined);
+  vi.mocked(deleteImageFileOnly).mockResolvedValue(true);
   vi.mocked(confirmDialog).mockResolvedValue(true);
 });
 
@@ -176,21 +181,49 @@ afterEach(() => {
 
 describe('gallery old image cleanup', () => {
   it.each([false, true])('checks old images and respects confirmation (%s) without enabling automatic cleanup', async confirmed => {
-    const preview = { paths: [keyOf(alpha, 'image-0.png')], bytes: 1024, unknownSizes: 0 };
-    vi.mocked(previewImageRetention).mockResolvedValue(preview);
-    vi.mocked(applyImageRetention).mockResolvedValue(1);
+    const path = keyOf(alpha, 'image-0.png');
+    vi.mocked(runImageRetention).mockImplementation(async (_policy, confirm) => {
+      if (!await confirm(1)) return;
+      markImageMissing(path);
+      return { deleted: 1, failed: 0 };
+    });
     vi.mocked(confirmDialog).mockResolvedValue(confirmed);
     const root = await mount();
     const cleanup = find(root, 'button').find(button => text(button).includes('清理旧图'))!;
     await click(cleanup);
     await flush();
 
-    expect(previewImageRetention).toHaveBeenCalledWith(settings.storage.retention);
+    expect(runImageRetention).toHaveBeenCalledWith(settings.storage.retention, expect.any(Function));
     expect(confirmDialog).toHaveBeenCalledWith(expect.objectContaining({ title: '清理旧图', text: expect.stringContaining('1 张') }));
-    if (confirmed) expect(applyImageRetention).toHaveBeenCalledWith(preview, settings.storage.retention);
-    else expect(applyImageRetention).not.toHaveBeenCalled();
+    expect(isImageMissing(path)).toBe(confirmed);
     expect(settings.storage.retention.enabled).toBe(false);
-    expect(listUserImageFolders).toHaveBeenCalledTimes(confirmed ? 2 : 1);
+    expect(listUserImageFolders).toHaveBeenCalledTimes(1);
+  });
+
+  it('remounts the cleanup button with its current progress and then clears it', async () => {
+    const state = imageRetentionProgress as Vue.ShallowRef<typeof imageRetentionProgress.value>;
+    const label = imageRetentionStatus as Vue.ShallowRef<string>;
+    let finish!: () => void;
+    vi.mocked(runImageRetention).mockImplementation(async () => {
+      state.value = { phase: 'scanning', automatic: false, done: 4, total: 10 };
+      label.value = '正在检索 4/10';
+      await new Promise<void>(resolve => { finish = resolve; });
+      state.value = undefined;
+      label.value = '';
+      return undefined;
+    });
+    const first = await mount();
+    const running = click(find(first, 'button').find(button => text(button).includes('清理旧图'))!);
+    await nextTick();
+
+    const reopened = await mount();
+    const button = find(reopened, 'button').find(element => text(element).includes('正在检索 4/10'))!;
+    expect(button.props.disabled).toBe(true);
+    finish();
+    await running;
+    await nextTick();
+    expect(text(find(button, 'span')[0])).toBe('清理旧图');
+    expect(button.props.disabled).toBe(false);
   });
 });
 
@@ -422,6 +455,7 @@ describe('gallery multi-select delete', () => {
   it('keeps failed deletions selected and reports them instead of pretending they went', async () => {
     vi.mocked(deleteImageFileOnly).mockImplementation(async path => {
       if (path.endsWith('image-1.png')) throw new Error('EBUSY');
+      return true;
     });
     const root = await selectMode();
     await click(find(root, '.gal-thumb')[0]);

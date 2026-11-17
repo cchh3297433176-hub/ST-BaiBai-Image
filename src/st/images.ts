@@ -27,6 +27,7 @@ export const ARTIST_PREVIEW_FOLDER = '柏宝绘_画师串';
 async function postImage(
   endpoint: string,
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<{ ok: boolean; status: number; text: string }> {
   const ctx = getContext();
   if (!ctx) throw new ImageStoreError('SillyTavern 上下文不可用');
@@ -34,6 +35,7 @@ async function postImage(
     method: 'POST',
     headers: ctx.getRequestHeaders(),
     body: JSON.stringify(body),
+    ...(signal && { signal }),
   });
   const text = await response.text().catch(() => '');
   return { ok: response.ok, status: response.status, text };
@@ -89,8 +91,8 @@ function parseJsonArray(text: string): unknown[] {
  * 落盘文件名里的角色名是哈希(见 floor/storage.ts imageFileName),可读名只能从目录名还原,
  * 故图库必须先取目录、再逐目录列图,不能反过来从文件名推。
  */
-export async function listUserImageFolders(): Promise<string[]> {
-  const { ok, status, text } = await postImage('/api/images/folders', {});
+export async function listUserImageFolders(signal?: AbortSignal): Promise<string[]> {
+  const { ok, status, text } = await postImage('/api/images/folders', {}, signal);
   if (!ok) {
     throw new ImageStoreError(
       `读取图片目录失败 (${status})${text ? `：${text.slice(0, 300)}` : ''}`,
@@ -108,13 +110,13 @@ export async function listUserImageFolders(): Promise<string[]> {
  */
 export async function listUserImages(
   folder: string,
-  options: { sortField?: 'date' | 'name'; sortOrder?: 'asc' | 'desc' } = {},
+  options: { sortField?: 'date' | 'name'; sortOrder?: 'asc' | 'desc'; signal?: AbortSignal } = {},
 ): Promise<string[]> {
   const { ok, status, text } = await postImage('/api/images/list', {
     folder,
     sortField: options.sortField ?? 'date',
     sortOrder: options.sortOrder ?? 'desc',
-  });
+  }, options.signal);
   if (!ok) {
     throw new ImageStoreError(
       `读取图片列表失败 (${status})${text ? `：${text.slice(0, 300)}` : ''}`,
@@ -165,8 +167,8 @@ export async function probeUserImage(
 }
 
 /** 删除 user/images 下的图片。返回 false 表示文件本就不存在(无需清理)。 */
-export async function deleteUserImage(path: string): Promise<boolean> {
-  const { ok, status, text } = await postImage('/api/images/delete', { path });
+export async function deleteUserImage(path: string, signal?: AbortSignal): Promise<boolean> {
+  const { ok, status, text } = await postImage('/api/images/delete', { path }, signal);
   if (ok) return true;
   if (status === 404) return false;
   throw new ImageStoreError(
