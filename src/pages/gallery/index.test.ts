@@ -193,11 +193,41 @@ describe('gallery old image cleanup', () => {
     await click(cleanup);
     await flush();
 
-    expect(runImageRetention).toHaveBeenCalledWith(settings.storage.retention, expect.any(Function));
+    expect(runImageRetention).toHaveBeenCalledWith(settings.storage.retention, expect.any(Function), expect.arrayContaining([path]));
     expect(confirmDialog).toHaveBeenCalledWith(expect.objectContaining({ title: '清理旧图', text: expect.stringContaining('1 张') }));
     expect(isImageMissing(path)).toBe(confirmed);
     expect(settings.storage.retention.enabled).toBe(false);
     expect(listUserImageFolders).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the saved rules and filters unmatched images after an empty cleanup', async () => {
+    const unmatched = keyOf(alpha, 'image-1.png');
+    vi.mocked(runImageRetention).mockImplementation(async (_policy, confirm) => {
+      await confirm(0, { retained: 57, unmatched: new Set([unmatched]) });
+      return undefined;
+    });
+    let root = await mount();
+    await click(find(root, 'button').find(button => text(button).includes('清理旧图'))!);
+    await flush();
+
+    root = await mount();
+    const summary = find(root, '.gal-cleanup-summary')[0];
+    expect(text(summary)).toContain('没有符合已保存规则的旧图');
+    expect(text(summary)).toContain('最近 6 个 AI 楼');
+    expect(text(summary)).toContain('57 张按规则保留，1 张未匹配');
+    expect(confirmDialog).not.toHaveBeenCalled();
+
+    await click(find(summary, 'button')[0]);
+    expect(find(root, '.gal-fold-trigger')).toHaveLength(1);
+    await click(find(root, '.gal-fold-trigger')[0]);
+    expect(find(root, 'img').map(image => image.props.src)).toEqual([
+      `/user/images/${encodeURIComponent(alpha)}/image-1.png`,
+    ]);
+
+    await click(find(root, '.gal-select-toggle')[0]);
+    await change(find(root, 'input').find(input => input.props.type === 'checkbox')!);
+    expect(text(find(root, '.gal-actionbar-count')[0])).toBe('已选 1 张');
+    expect(deleteImageFileOnly).not.toHaveBeenCalled();
   });
 
   it('remounts the cleanup button with its current progress and then clears it', async () => {

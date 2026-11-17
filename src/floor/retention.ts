@@ -15,7 +15,13 @@ type Progress = { phase: Phase; automatic: boolean; done?: number; total?: numbe
 export interface RetentionResult {
   deleted: number;
   failed: number;
+  reclassified?: number;
   interrupted?: string;
+}
+
+export interface GalleryRetentionSummary {
+  retained: number;
+  unmatched: ReadonlySet<string>;
 }
 
 const DAY = 86_400_000;
@@ -155,10 +161,10 @@ function assertCanDelete(snapshot: number): void {
   if (isGenerating()) throw new Error('酒馆正在生成回复，请等回复结束后再清理旧图');
 }
 
-async function findExpiredReferences(
+async function scanImageReferences(
   ctx: STContext, policy: ImageRetentionPolicy, valid: () => void,
   phase: 'scanning' | 'verifying', candidates?: ReadonlySet<string>,
-): Promise<string[]> {
+): Promise<ImageReferencePlan> {
   if (!ctx.characters || !Array.isArray(ctx.groups)) throw new Error('酒馆的角色和群聊列表尚未就绪');
   setProgress(phase);
   const utilsUrl = '/scripts/utils.js';
@@ -170,7 +176,7 @@ async function findExpiredReferences(
   const active = currentChat(ctx);
   const plan: ImageReferencePlan = { keep: new Set(), expire: new Set(), candidates };
   const now = Date.now();
-  planChatRetention(ctx.chat, policy.keepFloors, false, plan);
+  planChatRetention(ctx.chat, policy.keepFloors, isIdle(ctx.chat, now, policy.idleDays), plan);
   const chats = await savedChats(ctx, active, valid);
   let checked = 0;
   setProgress(phase, checked, chats.length);
@@ -179,7 +185,21 @@ async function findExpiredReferences(
     planChatRetention(messages, policy.keepFloors, isIdle(messages, now, policy.idleDays), plan);
     setProgress(phase, ++checked, chats.length);
   });
+  return plan;
+}
+
+function expiredImages(plan: ImageReferencePlan): string[] {
   return [...plan.expire].filter(path => !plan.keep.has(path) && !isImageMissing(path));
+}
+
+function summarizeGallery(plan: ImageReferencePlan, paths: readonly string[]): GalleryRetentionSummary {
+  const unmatched = new Set<string>();
+  let retained = 0;
+  for (const path of paths) {
+    if (plan.keep.has(path)) retained++;
+    else if (!plan.expire.has(path)) unmatched.add(path);
+  }
+  return { retained, unmatched };
 }
 
 async function existingImages(ctx: STContext, paths: readonly string[], valid: () => void): Promise<string[]> {
@@ -283,22 +303,26 @@ export function retentionResultText(result: RetentionResult): string {
   const parts = [];
   if (result.deleted) parts.push(`已删除 ${result.deleted} 张旧图`);
   if (result.failed) parts.push(`${result.failed} 张删除失败`);
+  if (result.reclassified) parts.push(`复核时跳过 ${result.reclassified} 张已不符合规则的图片`);
   if (result.interrupted) parts.push(result.interrupted);
   return parts.length ? parts.join('，') + '。' : '没有符合规则且仍存在的旧图。';
 }
 
 /** 一次清理包含检索、确认与删除，生命周期独立于图库和设置页。 */
 export function runImageRetention(
-  policy: ImageRetentionPolicy, confirm: (count: number) => Promise<boolean>,
+  policy: ImageRetentionPolicy,
+  confirm: (count: number, summary?: GalleryRetentionSummary) => Promise<boolean>,
+  galleryPaths?: readonly string[],
 ): Promise<RetentionResult | undefined> {
   return withCleanupLock(false, async () => {
     const ctx = getContext();
     if (!ctx) throw new Error('酒馆尚未就绪');
     const previewRevision = revision;
-    const expired = await findExpiredReferences(ctx, policy, assertEnabled, 'scanning');
-    const paths = await existingImages(ctx, expired, assertEnabled);
+    const plan = await scanImageReferences(ctx, policy, assertEnabled, 'scanning');
+    const paths = await existingImages(ctx, expiredImages(plan), assertEnabled);
+    const summary = galleryPaths && summarizeGallery(plan, galleryPaths);
     setProgress('confirming');
-    if (!await confirm(paths.length)) return;
+    if (!await confirm(paths.length, summary)) return;
 
     const confirmedRevision = revision;
     const canDelete = () => assertCanDelete(confirmedRevision);
@@ -306,10 +330,12 @@ export function runImageRetention(
     // 只复核已确认路径的聊天引用。文件若已被别处删除，删除接口会返回 404。
     const confirmedContext = getContext();
     if (!confirmedContext) throw new Error('酒馆尚未就绪');
-    const result = paths.length
-      ? await deletePaths(await findExpiredReferences(confirmedContext, policy, canDelete, 'verifying', new Set(paths)), canDelete)
-      : { deleted: 0, failed: 0 };
-    if (!result.failed && !result.interrupted && previewRevision === confirmedRevision) {
+    const verified = paths.length
+      ? expiredImages(await scanImageReferences(confirmedContext, policy, canDelete, 'verifying', new Set(paths)))
+      : [];
+    const result = await deletePaths(verified, canDelete);
+    if (paths.length > verified.length) result.reclassified = paths.length - verified.length;
+    if (!result.failed && !result.interrupted && !result.reclassified && previewRevision === confirmedRevision) {
       lastSweep = { time: Date.now(), revision: confirmedRevision, policy };
     }
     return result;
@@ -354,7 +380,8 @@ export function bindImageRetention(): void {
       void withCleanupLock(true, async () => {
         const current = getContext();
         if (!current) throw new Error('酒馆尚未就绪');
-        const paths = await findExpiredReferences(current, policy, valid, 'scanning');
+        const plan = await scanImageReferences(current, policy, valid, 'scanning');
+        const paths = expiredImages(plan);
         const result = await deletePaths(await existingImages(current, paths, valid), valid);
         if (!result.failed && !result.interrupted) {
           lastSweep = { time: Date.now(), revision: snapshot, policy };

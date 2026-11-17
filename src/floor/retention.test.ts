@@ -119,6 +119,30 @@ describe('柏宝绘旧图清理', () => {
     expect(ctx.chat[0].extra).toEqual(getExtra([old, shared, legacy]));
   });
 
+  it('打开已闲置的聊天仍只保留最后一个有图楼，图库中未匹配的图供手动查看', async () => {
+    const standalone = 'user/images/柏宝绘_甲/bbi_a_0_b-gstandalone.png';
+    mocks.getContext.mockReturnValue({
+      characters: [], groups: [],
+      chat: [ai(old), ai(recent, oldSwipe), { ...ai(), send_date: '2020-01-01T00:00:00Z' }],
+      getCurrentChatId: () => 'idle-but-open',
+    });
+    const galleryPaths = [old, recent, oldSwipe, standalone];
+    mocks.listUserImages.mockResolvedValue(galleryPaths.map(path => path.split('/').pop()));
+    mocks.deleteImageFileOnly.mockResolvedValue(true);
+
+    const confirm = vi.fn(async () => true);
+    const rules = { ...policy, keepFloors: 3 };
+    const summary = { retained: 2, unmatched: new Set([standalone]) };
+    await expect(runImageRetention(rules, confirm, galleryPaths)).resolves.toEqual({ deleted: 1, failed: 0 });
+    expect(confirm).toHaveBeenCalledExactlyOnceWith(1, summary);
+    expect(mocks.deleteImageFileOnly).toHaveBeenCalledExactlyOnceWith(old, expect.any(AbortSignal));
+
+    confirm.mockResolvedValue(false);
+    await expect(runImageRetention(rules, confirm, galleryPaths.slice(1))).resolves.toBeUndefined();
+    expect(confirm).toHaveBeenLastCalledWith(0, summary);
+    expect(mocks.deleteImageFileOnly).toHaveBeenCalledTimes(1);
+  });
+
   it('等待确认后重新查保留楼层，生成回复时不会删除', async () => {
     const chat = [ai(old), ai(recent)];
     mocks.getContext.mockReturnValue({
@@ -138,7 +162,7 @@ describe('柏宝绘旧图清理', () => {
       chat.reverse();
       return true;
     });
-    expect(result).toEqual({ deleted: 0, failed: 0 });
+    expect(result).toEqual({ deleted: 0, failed: 0, reclassified: 1 });
     expect(mocks.deleteImageFileOnly).not.toHaveBeenCalled();
     expect(imageRetentionProgress.value).toBeUndefined();
   });
@@ -170,6 +194,7 @@ describe('柏宝绘旧图清理', () => {
 
   it('自动清理会在输入框聚焦和酒馆切到后台时运行，后续消息不推迟已安排的时间', async () => {
     vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 2 * 86_400_000);
     const eventSource = new EventEmitter();
     const chat = [ai(old), ai(), ai(), ai(recent)];
     mocks.getContext.mockReturnValue({

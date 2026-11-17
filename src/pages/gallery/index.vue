@@ -1,3 +1,10 @@
+<script lang="ts">
+import { shallowRef } from 'vue';
+import type { GalleryRetentionSummary } from '@/floor/retention';
+
+const lastCleanup = shallowRef<{ message: string; rules?: string; summary?: GalleryRetentionSummary }>();
+</script>
+
 <script setup lang="ts">
 import { formatBytes } from '@/bytes';
 import Icon from '@/components/Icon.vue';
@@ -74,6 +81,7 @@ const error = ref('');
 /** 部分目录读取失败的条数:整页不失败,但要如实说明少了几组。 */
 const partialFailed = ref(0);
 const query = ref('');
+const showUnmatched = ref(false);
 
 /**
  * 静态路由 /user/images/* 服务端做 decodeURIComponent(users.js createRouteHandler),
@@ -303,8 +311,12 @@ const totalSizeText = computed(() => {
 
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase();
-  if (!q) return groups.value;
-  return groups.value.filter(group => group.name.toLowerCase().includes(q));
+  const matching = q ? groups.value.filter(group => group.name.toLowerCase().includes(q)) : groups.value;
+  const unmatched = lastCleanup.value?.summary?.unmatched;
+  if (!showUnmatched.value || !unmatched) return matching;
+  return matching
+    .map(group => ({ ...group, images: group.images.filter(image => unmatched.has(image.key)) }))
+    .filter(group => group.images.length > 0);
 });
 
 const totalImages = computed(() => groups.value.reduce((n, g) => n + g.images.length, 0));
@@ -479,27 +491,38 @@ async function deleteSelected(): Promise<void> {
 
 async function cleanupOldImages(): Promise<void> {
   if (imageRetentionProgress.value || selecting.value || deleting.value || !settings.enabled) return;
+  lastCleanup.value = undefined;
+  showUnmatched.value = false;
+  let summary: GalleryRetentionSummary | undefined;
   try {
     const policy = { ...settings.storage.retention };
-    const result = await runImageRetention(policy, count => {
+    const rules = `每个活跃聊天保留最近 ${policy.keepFloors} 个 AI 楼的插图，闲置满 ${policy.idleDays} 天的聊天保留最后一个有图楼。`;
+    const paths = groups.value.flatMap(group => group.images.map(image => image.key));
+    const result = await runImageRetention(policy, async (count, gallerySummary) => {
+      summary = gallerySummary;
       if (!count) {
-        toastr.info('没有符合已保存规则的旧图。', '柏宝绘');
-        return Promise.resolve(false);
+        lastCleanup.value = { message: '没有符合已保存规则的旧图。', rules, summary };
+        return false;
       }
       return confirmDialog({
         title: '清理旧图',
-        text: `找到 ${count} 张旧图。活跃聊天保留最近 ${policy.keepFloors} 个 AI 楼的插图，闲置 ${policy.idleDays} 天的聊天保留最后一个有图楼。确认后删除这些图片文件。`,
+        text: `找到 ${count} 张旧图。${rules}确认后删除这些图片文件。`,
         confirmText: '清理这批旧图',
         tone: 'danger',
       });
-    });
+    }, paths);
     if (result) {
       const message = retentionResultText(result);
-      if (result.failed || result.interrupted) toastr.warning(message, '柏宝绘');
+      lastCleanup.value = { message, rules, summary };
+      if (result.failed || result.interrupted || result.reclassified) toastr.warning(message, '柏宝绘');
       else toastr.success(message, '柏宝绘');
+    } else if (!lastCleanup.value) {
+      lastCleanup.value = { message: '已取消清理。', rules, summary };
     }
   } catch (error) {
-    toastr.error(error instanceof Error ? error.message : String(error), '柏宝绘');
+    const message = error instanceof Error ? error.message : String(error);
+    lastCleanup.value = { message: `清理未完成。${message}` };
+    toastr.error(message, '柏宝绘');
   }
 }
 
@@ -565,6 +588,22 @@ async function open(image: GalleryImage): Promise<void> {
       </span>
     </div>
 
+    <div v-if="lastCleanup && !imageRetentionProgress" class="gal-cleanup-summary">
+      <p role="status">{{ lastCleanup.message }}</p>
+      <p v-if="lastCleanup.rules">{{ lastCleanup.rules }}</p>
+      <template v-if="lastCleanup.summary">
+        <p>上次扫描的图库图片中，有 {{ lastCleanup.summary.retained }} 张按规则保留，{{ lastCleanup.summary.unmatched.size }} 张未匹配到柏宝绘楼层记录。</p>
+        <button
+          v-if="lastCleanup.summary.unmatched.size"
+          type="button"
+          class="bbi-btn bbi-btn-sm"
+          :aria-pressed="showUnmatched"
+          :disabled="selecting || deleting"
+          @click="showUnmatched = !showUnmatched"
+        >{{ showUnmatched ? '显示全部图片' : '查看未匹配图片' }}</button>
+      </template>
+    </div>
+
     <!-- 选择态操作条:紧跟工具条、sticky 吸顶。
          放这里而非列表末尾:呼出它的「选择」钮就在上一行,一按就看见(摆到底部的话,
          角色多时按下去屏幕上什么都不动,像没生效);吸顶又保证往下翻多久都还在。 -->
@@ -612,7 +651,9 @@ async function open(image: GalleryImage): Promise<void> {
       <p class="gal-state-hint">在聊天里生成图片后，会按角色自动归类到这里。</p>
     </div>
 
-    <p v-else-if="!filtered.length" class="gal-state-inline">没有匹配「{{ query }}」的角色。</p>
+    <p v-else-if="!filtered.length" class="gal-state-inline">
+      {{ showUnmatched ? '当前列表没有上次扫描未匹配到的图片。' : `没有匹配「${query}」的角色。` }}
+    </p>
 
     <div v-else class="gal-groups">
       <section
@@ -763,6 +804,20 @@ async function open(image: GalleryImage): Promise<void> {
   border-color: var(--bbi-accent);
   color: var(--bbi-accent);
   background: var(--bbi-surface-2);
+}
+
+.gal-cleanup-summary {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border-radius: var(--bbi-radius-sm);
+  background: var(--bbi-surface-2);
+  font-size: 12px;
+}
+.gal-cleanup-summary p {
+  margin: 0 0 6px;
+}
+.gal-cleanup-summary p:last-child {
+  margin-bottom: 0;
 }
 
 .gal-warn {

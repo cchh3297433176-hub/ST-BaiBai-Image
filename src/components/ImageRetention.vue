@@ -72,7 +72,7 @@ function disable() {
       <span class="bbi-field-label">闲置天数</span>
       <input v-model.number="idleDays" class="bbi-input bbi-num" type="number" inputmode="numeric" min="1" step="1" :disabled="!!imageRetentionProgress" />
     </label>
-    <p class="bbi-field-hint">闲置聊天只保留最后一个有图的 AI 楼。图库的「清理旧图」使用已保存的规则。</p>
+    <p class="bbi-field-hint">楼数按每个聊天计算，同一楼的多张插图一起保留。闲置从最后一条消息算起，满天数只保留最后一个有图的 AI 楼。图库使用已保存的规则。</p>
     <p v-if="settings.storage.retention.enabled" class="bbi-field-hint">
       已开启自动清理 · 最近 {{ settings.storage.retention.keepFloors }} 个 AI 楼 · 闲置 {{ settings.storage.retention.idleDays }} 天
     </p>
