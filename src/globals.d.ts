@@ -4,6 +4,7 @@ declare global {
   const _: any;
   const toastr: any;
   const __BBI_VERSION__: string;
+  const __BBI_REMOTE_MANIFEST_URL__: string;
 }
 
 export {};

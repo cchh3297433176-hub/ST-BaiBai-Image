@@ -73,6 +73,7 @@ export interface STContext {
   name1: string;
   name2: string;
   characters?: STCharacter[];
+  groups?: Array<{ id: string | number; chats?: string[] }>;
   /** 当前角色在 characters 中的索引(字符串/数字);群聊时为空 */
   characterId?: string | number;
   /** 当前群组 id;非群聊为空 */

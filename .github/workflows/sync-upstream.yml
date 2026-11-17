@@ -1,0 +1,36 @@
+name: Sync BaiBai Image upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'baibai-git/ST-BaiBai-Image' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      BBI_FORK_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Merge, validate, build and publish
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          bash scripts/sync-upstream.sh
+          git push origin HEAD:main

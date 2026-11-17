@@ -19,14 +19,17 @@ const globals: Record<string, string> = {
   toastr: 'toastr',
 };
 
-const package_json = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')) as {
+const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8')) as {
   version?: string;
+  homePage?: string;
 };
-const package_version = String(package_json.version ?? '');
+
+const updateRepo = new URL(manifest.homePage ?? 'https://github.com/baibai-git/ST-BaiBai-Image').pathname;
 
 export default defineConfig(({ mode }) => ({
   define: {
-    __BBI_VERSION__: JSON.stringify(package_version),
+    __BBI_VERSION__: JSON.stringify(manifest.version),
+    __BBI_REMOTE_MANIFEST_URL__: JSON.stringify('https://raw.githubusercontent.com' + updateRepo + '/main/manifest.json'),
   },
 
   plugins: [

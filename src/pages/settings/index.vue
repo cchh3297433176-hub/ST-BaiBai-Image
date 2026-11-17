@@ -4,6 +4,7 @@ import BbiTextarea from '@/components/BbiTextarea.vue';
 import Collapsible from '@/components/Collapsible.vue';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import Icon from '@/components/Icon.vue';
+import ImageRetention from '@/components/ImageRetention.vue';
 import ModalMask from '@/components/ModalMask.vue';
 import { fetchModels, testChannel } from '@/api/client';
 import {
@@ -533,6 +534,7 @@ async function confirmUpdate() {
     </div>
 
     <div class="bbi-sections">
+      <ImageRetention />
       <!-- 基本设置:主题 / 导航 / 入口 / 悬浮球等界面项,置于首位 -->
       <Collapsible title="基本设置" :open="false">
         <div class="bbi-select-row">

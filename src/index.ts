@@ -2,6 +2,7 @@ import App from '@/App.vue';
 import { bindAutoTagging } from '@/autoTag/runner';
 import { bindTagActionButtons } from '@/floor/actionButton';
 import { bindFloorHydration } from '@/floor/hydrate';
+import { bindImageRetention } from '@/floor/retention';
 import { injectMenuButton } from '@/menu';
 import { registerPublicInterface } from '@/public/register';
 import { bindCharTagSync } from '@/state/charTags';
@@ -102,6 +103,7 @@ async function hydrateWhenReady(attempt = 0) {
       ensureImageTagRegexRegistered();
       bindAutoTagging();
       bindFloorHydration();
+      bindImageRetention();
       bindTagActionButtons();
       // 公开接口必须排在 hydrateSettings 之后:设置回灌前 getBackendStatus() 读的是
       // 默认值,会把配好的用户报成「未配置」。排在 bindCharTagSync 之后则是为了让

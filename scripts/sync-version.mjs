@@ -10,10 +10,19 @@ const pkg = JSON.parse(await readFile(packagePath, 'utf8'));
 const manifestText = await readFile(manifestPath, 'utf8');
 const manifest = JSON.parse(manifestText);
 
-const version = String(pkg.version ?? '').trim();
-if (!version) {
+const upstreamVersion = String(pkg.version ?? '').trim();
+if (!upstreamVersion) {
   throw new Error('package.json version is required');
 }
+
+const fork = process.env.BBI_FORK_REPOSITORY;
+if (fork && !/^[\w-]+\/[\w.-]+$/.test(fork)) {
+  throw new Error('BBI_FORK_REPOSITORY must be owner/repo');
+}
+const build = process.env.BBI_FORK_BUILD ?? '1';
+if (!/^[1-9][0-9]*$/.test(build)) throw new Error('BBI_FORK_BUILD must be a positive integer');
+const version = fork ? upstreamVersion + '-retention.' + build : upstreamVersion;
+if (fork) manifest.homePage = 'https://github.com/' + fork;
 
 const expectedJs = `dist/index.js?ver=${encodeURIComponent(version)}`;
 manifest.version = version;

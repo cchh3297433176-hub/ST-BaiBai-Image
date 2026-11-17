@@ -17,6 +17,7 @@ import {
   vibeFingerprint,
   vibeMetaFromData,
 } from '@/backends/vibeStore';
+import { normalizeImageRetention, type ImageRetentionPolicy } from '@/floor/retentionPolicy';
 import { getContext } from '@/st/context';
 import { reactive, watch } from 'vue';
 
@@ -591,6 +592,7 @@ export interface StoragePrefs {
    * 但无法再从图片本身提取。仅影响新图,存量 PNG 不动;转码失败自动回退 PNG。
    */
   saveAsJpeg: boolean;
+  retention: ImageRetentionPolicy;
 }
 
 export interface ExcludesSettings {
@@ -1474,7 +1476,7 @@ function defaults(): ImageSettings {
       },
     },
     excludes: excludesDefaults(),
-    storage: { saveAsJpeg: true },
+    storage: { saveAsJpeg: true, retention: normalizeImageRetention() },
   };
 }
 
@@ -2332,6 +2334,7 @@ function normalize(raw: unknown): ImageSettings {
   const rs = (r.storage ?? {}) as Partial<StoragePrefs>;
   merged.storage = {
     saveAsJpeg: typeof rs.saveAsJpeg === 'boolean' ? rs.saveAsJpeg : d.storage.saveAsJpeg,
+    retention: normalizeImageRetention(rs.retention ?? {}),
   };
   return merged;
 }
