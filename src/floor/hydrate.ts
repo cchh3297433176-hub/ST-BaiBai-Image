@@ -8,7 +8,6 @@ import { setNaiConcurrency } from '@/floor/genQueue';
 import { clearAllGen, pruneGenSlots } from '@/floor/genState';
 import { clearAllTagPlans } from '@/floor/tagPlanState';
 import { SlotRegistry } from '@/floor/registry';
-import { firstRetainedFloor } from '@/floor/retentionPolicy';
 import { checkSlotHealth, floorIdOf } from '@/floor/slotHealth';
 import { historyEntries, latestStaleEntry, promptHash, readStore } from '@/floor/storage';
 import { getContext, type STContext } from '@/st/context';
@@ -134,9 +133,7 @@ export function hydrateMessage(messageId: number, ctx: STContext): void {
   /** 本次水合后「应该存在」的槽位:key → {锚点, vnode}。消息没了就留空,下面统一卸载。 */
   const desired = new Map<string, { anchor: HTMLElement; vnode: VNode }>();
 
-  const retention = settings.storage.retention;
-  const hidden = settings.enabled && retention.enabled && messageId < firstRetainedFloor(ctx.chat, retention.keepFloors);
-  if (message && !hidden) {
+  if (message) {
     const tags = parseImageTags(message.mes);
     const swipeId = message.swipe_id ?? 0;
     // 槽位可能整个消失(用户删掉 tag / swipe 到 tag 更少的一版):那些槽位再没有卡片
@@ -355,16 +352,6 @@ export function bindFloorHydration(): boolean {
     const id = Number(messageCount) - 1;
     if (Number.isInteger(id) && id >= 0) scheduleHydration(current => hydrateMessage(id, current));
     else onVisibleReload();
-    const retention = settings.storage.retention;
-    if (!settings.enabled || !retention.enabled) return;
-    scheduleHydration(current => {
-      const cutoff = firstRetainedFloor(current.chat, retention.keepFloors);
-      for (const key of slotRegistry.keys()) {
-        const host = slotRegistry.get(key)?.container.host;
-        const floor = host ? floorIdOf(host) : null;
-        if (floor !== null && floor < cutoff) unmountKey(key);
-      }
-    });
   };
   const onFullReload = () => {
     clearAutoGenerateFlags();
@@ -389,16 +376,6 @@ export function bindFloorHydration(): boolean {
   eventSource.on(eventTypes.CHAT_CHANGED, onFullReload);
 
   scheduleHydration(hydrateAll, hydrateVisible);
-
-  watch(
-    () => [settings.enabled, settings.storage.retention.enabled, settings.storage.retention.keepFloors],
-    () => scheduleHydration(current => {
-      for (const floor of document.querySelectorAll('#chat .mes[mesid]')) {
-        const id = Number(floor.getAttribute('mesid'));
-        if (Number.isInteger(id)) hydrateMessage(id, current);
-      }
-    }),
-  );
 
   // 自愈层:兜住 ST 与第三方那些「重写 .mes_text 但不发事件」的路径(见文件头注释)
   bindSlotSelfHealing();

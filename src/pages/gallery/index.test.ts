@@ -8,13 +8,22 @@ import { listUserImageFolders, listUserImages, probeUserImage } from '@/st/image
 import { deleteImageFileOnly } from '@/floor/storage';
 import { isImageMissing, resetMissingImages } from '@/floor/missingImages';
 import { openLightbox } from '@/floor/lightbox';
+import { applyImageRetention, previewImageRetention } from '@/floor/retention';
 import { confirmDialog } from '@/components/confirm';
+import { settings } from '@/state/settings';
 
 declare const toastr: { success: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
 
 vi.mock('@/components/Icon.vue', () => ({ default: () => null }));
 vi.mock('@/components/confirm', () => ({ confirmDialog: vi.fn() }));
 vi.mock('@/floor/lightbox', () => ({ openLightbox: vi.fn() }));
+vi.mock('@/floor/retention', () => ({
+  applyImageRetention: vi.fn(),
+  previewImageRetention: vi.fn(),
+}));
+vi.mock('@/state/settings', () => ({
+  settings: { enabled: true, storage: { retention: { enabled: false, keepFloors: 6, idleDays: 30 } } },
+}));
 vi.mock('@/floor/storage', () => ({
   readStore: vi.fn(),
   sidecarPathFor: vi.fn(),
@@ -163,6 +172,26 @@ afterEach(() => {
   app = undefined;
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+});
+
+describe('gallery old image cleanup', () => {
+  it.each([false, true])('checks old images and respects confirmation (%s) without enabling automatic cleanup', async confirmed => {
+    const preview = { paths: [keyOf(alpha, 'image-0.png')], bytes: 1024, unknownSizes: 0 };
+    vi.mocked(previewImageRetention).mockResolvedValue(preview);
+    vi.mocked(applyImageRetention).mockResolvedValue(1);
+    vi.mocked(confirmDialog).mockResolvedValue(confirmed);
+    const root = await mount();
+    const cleanup = find(root, 'button').find(button => text(button).includes('清理旧图'))!;
+    await click(cleanup);
+    await flush();
+
+    expect(previewImageRetention).toHaveBeenCalledWith(settings.storage.retention);
+    expect(confirmDialog).toHaveBeenCalledWith(expect.objectContaining({ title: '清理旧图', text: expect.stringContaining('1 张') }));
+    if (confirmed) expect(applyImageRetention).toHaveBeenCalledWith(preview, settings.storage.retention);
+    else expect(applyImageRetention).not.toHaveBeenCalled();
+    expect(settings.storage.retention.enabled).toBe(false);
+    expect(listUserImageFolders).toHaveBeenCalledTimes(confirmed ? 2 : 1);
+  });
 });
 
 describe('gallery on-demand rendering', () => {

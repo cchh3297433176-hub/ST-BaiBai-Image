@@ -12,7 +12,6 @@ export interface RetentionPreview {
   paths: readonly string[];
   bytes: number;
   unknownSizes: number;
-  revision: number;
 }
 
 const DAY = 86_400_000;
@@ -20,7 +19,6 @@ const AUTOMATIC_INTERVAL = 60 * 60 * 1000;
 const AUTOMATIC_DELAY = 90_000;
 let revision = 0;
 let bound = false;
-let generating = false;
 let busy = false;
 let lastSweep = 0;
 let hostDateParser: ((value: string) => { valueOf(): number }) | undefined;
@@ -96,7 +94,13 @@ function isIdle(chat: readonly STMessage[], now: number, days: number): boolean 
 }
 
 function assertStable(expected: number): void {
-  if (revision !== expected || generating) throw new Error('聊天刚刚发生变化，请重新预览');
+  if (revision !== expected) throw new Error('聊天刚刚发生变化，请重新预览');
+}
+
+function isGenerating(): boolean {
+  // ST 只在实际锁住发送按钮时设置这个标记。生成开始事件也会在试算提示词、
+  // 执行斜杠指令前触发，这些路径可能没有对应的结束事件。
+  return typeof document !== 'undefined' && document.body?.dataset.generating === 'true';
 }
 
 async function findExpiredImages(policy: ImageRetentionPolicy, valid: () => void): Promise<string[]> {
@@ -185,7 +189,7 @@ export function previewImageRetention(policy: ImageRetentionPolicy): Promise<Ret
       }
     }
     valid();
-    return { paths: existing, bytes, unknownSizes, revision: snapshot };
+    return { paths: existing, bytes, unknownSizes };
   });
 }
 
@@ -201,12 +205,14 @@ async function deletePaths(paths: readonly string[], valid: () => void): Promise
   return deleted;
 }
 
-/** 批量操作用预览核对的同一批路径。聊天切换、改楼、分支或发送后，旧预览失效。 */
+/** 重新计算保留范围，且只处理预览里已经确认的文件。 */
 export function applyImageRetention(preview: RetentionPreview, policy: ImageRetentionPolicy): Promise<number> {
   return withCleanupLock(async () => {
+    const snapshot = revision;
     const valid = () => {
-      assertStable(preview.revision);
+      assertStable(snapshot);
       if (!settings.enabled) throw new Error('柏宝绘已停用');
+      if (isGenerating()) throw new Error('酒馆正在生成回复，请等回复结束后再清理旧图');
     };
     valid();
     const previewed = new Set(preview.paths);
@@ -236,7 +242,7 @@ export function bindImageRetention(): void {
     timer = setTimeout(() => {
       timer = undefined;
       if (!settings.enabled || !settings.storage.retention.enabled) return;
-      if (isComposing() || generating || busy) {
+      if (isComposing() || isGenerating() || busy) {
         schedule();
         return;
       }
@@ -246,7 +252,7 @@ export function bindImageRetention(): void {
       const valid = () => {
         assertStable(snapshot);
         const current = settings.storage.retention;
-        if (isComposing() || !settings.enabled || !current.enabled
+        if (isComposing() || isGenerating() || !settings.enabled || !current.enabled
           || policy.keepFloors !== current.keepFloors || policy.idleDays !== current.idleDays) {
           throw new Error('旧图清理已暂停');
         }
@@ -268,26 +274,16 @@ export function bindImageRetention(): void {
   for (const event of [
     events.CHAT_CHANGED, events.CHAT_CREATED, events.CHAT_DELETED, events.GROUP_CHAT_CREATED,
     events.GROUP_CHAT_DELETED, events.CHAT_RENAMED, events.MESSAGE_SENT, events.MESSAGE_DELETED,
-    events.MESSAGE_EDITED, events.MESSAGE_SWIPED, events.MESSAGE_UPDATED, events.MESSAGE_RECEIVED,
+    events.MESSAGE_EDITED, events.MESSAGE_SWIPED, events.MESSAGE_SWIPE_DELETED, events.MESSAGE_RECEIVED,
   ]) {
     if (event) ctx.eventSource.on(event, invalidate);
-  }
-  if (events.GENERATION_STARTED) ctx.eventSource.on(events.GENERATION_STARTED, () => {
-    generating = true;
-    invalidate();
-  });
-  for (const event of [events.GENERATION_STOPPED, events.GENERATION_ENDED]) {
-    if (event) ctx.eventSource.on(event, () => {
-      generating = false;
-      invalidate();
-    });
   }
 
   // 在设定页首次确认后启动；以后由启动、活动变化与低频定时器驱动。
   watch(
     () => [settings.enabled, settings.storage.retention.enabled,
       settings.storage.retention.keepFloors, settings.storage.retention.idleDays],
-    invalidate,
+    schedule,
   );
   schedule();
 }

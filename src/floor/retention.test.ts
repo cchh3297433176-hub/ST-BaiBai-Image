@@ -1,6 +1,8 @@
+import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resetMissingImages } from '@/floor/missingImages';
 import type { STMessage } from '@/st/context';
-import { applyImageRetention, previewImageRetention } from './retention';
+import { applyImageRetention, bindImageRetention, previewImageRetention } from './retention';
 import { firstRetainedFloor, planChatRetention } from './retentionPolicy';
 
 const mocks = vi.hoisted(() => ({
@@ -19,7 +21,9 @@ vi.mock('@/st/images', () => ({
   probeUserImage: mocks.probeUserImage,
 }));
 vi.mock('@/floor/storage', () => ({ deleteImageFileOnly: mocks.deleteImageFileOnly }));
-vi.mock('@/state/settings', () => ({ settings: { enabled: true } }));
+vi.mock('@/state/settings', () => ({
+  settings: { enabled: true, storage: { retention: { enabled: false, keepFloors: 1, idleDays: 30 } } },
+}));
 
 const old = 'user/images/柏宝绘_甲/bbi_a_0_b-gold.png';
 const oldSwipe = 'user/images/柏宝绘_甲/bbi_a_1_b-goldswipe.jpg';
@@ -38,6 +42,7 @@ const ai = (...paths: string[]): STMessage => ({
 const user: STMessage = { mes: '用户', name: '乙', is_user: true, is_system: false };
 
 afterEach(() => {
+  resetMissingImages();
   vi.unstubAllGlobals();
   vi.resetAllMocks();
 });
@@ -93,5 +98,37 @@ describe('柏宝绘旧图清理', () => {
     expect(await applyImageRetention(preview, policy)).toBe(2);
     expect(mocks.deleteImageFileOnly.mock.calls).toEqual([[old], [idleOld]]);
     expect(ctx.chat[0].extra).toEqual(getExtra([old, shared]));
+  });
+
+  it('忽略提示词试算和重渲染，实际生成时暂停删除，并重新核对变动后的楼层', async () => {
+    const eventSource = new EventEmitter();
+    const chat = [ai(old), ai(recent)];
+    mocks.getContext.mockReturnValue({
+      characters: [{ avatar: 'a.png' }], groups: [], chat, characterId: 0,
+      getCurrentChatId: () => 'main', getRequestHeaders: () => ({}), eventSource,
+      eventTypes: { GENERATION_STARTED: 'start', MESSAGE_UPDATED: 'update', MESSAGE_EDITED: 'edit' },
+    });
+    mocks.listUserImages.mockResolvedValue([old, recent].map(path => path.split('/').pop()));
+    mocks.probeUserImage.mockResolvedValue({ exists: true, size: 400 });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      eventSource.emit('start', 'normal', {}, true);
+      eventSource.emit('update', 0);
+      return Response.json([{ file_id: 'main' }]);
+    }));
+    const dataset: Record<string, string> = {};
+    vi.stubGlobal('document', { body: { dataset } });
+    bindImageRetention();
+
+    const preview = await previewImageRetention(policy);
+    expect(preview.paths).toEqual([old]);
+
+    dataset.generating = 'true';
+    await expect(applyImageRetention(preview, policy)).rejects.toThrow('正在生成回复');
+    delete dataset.generating;
+
+    chat.reverse();
+    eventSource.emit('edit', 1);
+    expect(await applyImageRetention(preview, policy)).toBe(0);
+    expect(mocks.deleteImageFileOnly).not.toHaveBeenCalled();
   });
 });

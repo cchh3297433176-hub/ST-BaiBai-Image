@@ -19,16 +19,29 @@ watch(() => settings.storage.retention, current => {
   idleDays.value = current.idleDays;
 });
 
-async function preview() {
+function readRules(): ImageRetentionPolicy | undefined {
   const floors = Number(keepFloors.value);
   const days = Number(idleDays.value);
   if (!Number.isSafeInteger(floors) || floors < 1 || !Number.isSafeInteger(days) || days < 1) {
     status.value = '楼数和闲置天数需填写大于 0 的整数。';
     return;
   }
+  return { enabled: settings.storage.retention.enabled, keepFloors: floors, idleDays: days };
+}
+
+function saveRules() {
+  const policy = readRules();
+  if (!policy || policy.enabled) return;
+  settings.storage.retention = policy;
+  status.value = '规则已保存，可在图库清理旧图。';
+}
+
+async function preview() {
+  const rules = readRules();
+  if (!rules) return;
   busy.value = true;
   status.value = '正在检查已有聊天和旧图…';
-  const policy = { enabled: true, keepFloors: floors, idleDays: days };
+  const policy = { ...rules, enabled: true };
   try {
     pending.value = { policy, preview: await previewImageRetention(policy) };
     status.value = '';
@@ -72,12 +85,13 @@ function disable() {
       <span class="bbi-field-label">闲置天数</span>
       <input v-model.number="idleDays" class="bbi-input bbi-num" type="number" inputmode="numeric" min="1" step="1" :disabled="busy" />
     </label>
-    <p class="bbi-field-hint">闲置聊天只留最后一个有图楼里的图片。确认后会清理已有旧图，并定期补清。</p>
+    <p class="bbi-field-hint">闲置聊天只留最后一个有图楼里的图片。保存的规则也用于图库里的「清理旧图」。</p>
     <p v-if="settings.storage.retention.enabled" class="bbi-field-hint">
       正在使用 {{ settings.storage.retention.keepFloors }} 楼 / {{ settings.storage.retention.idleDays }} 天
     </p>
     <button type="button" class="bbi-btn bbi-btn-primary" :disabled="busy || !settings.enabled" @click="preview">预览旧图</button>
     <button v-if="settings.storage.retention.enabled" type="button" class="bbi-btn" :disabled="busy" @click="disable">暂停自动清理</button>
+    <button v-else type="button" class="bbi-btn" :disabled="busy" @click="saveRules">保存规则</button>
     <p v-if="status" class="bbi-field-hint" role="status">{{ status }}</p>
 
     <ConfirmDialog
